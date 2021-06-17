@@ -1,294 +1,204 @@
 package main
 
 import (
-	"io/ioutil"
-	"os"
-	"strings"
 	"testing"
 
-	"github.com/Sirupsen/logrus"
-	cliflags "github.com/docker/docker/cli/flags"
-	"github.com/docker/docker/daemon"
-	"github.com/docker/docker/opts"
-	"github.com/docker/docker/pkg/mflag"
-	"github.com/docker/go-connections/tlsconfig"
+	"github.com/docker/docker/daemon/config"
+	"github.com/sirupsen/logrus"
+	"github.com/spf13/pflag"
+	"gotest.tools/v3/assert"
+	is "gotest.tools/v3/assert/cmp"
+	"gotest.tools/v3/fs"
 )
 
-func TestLoadDaemonCliConfigWithoutOverriding(t *testing.T) {
-	c := &daemon.Config{}
-	common := &cliflags.CommonFlags{
-		Debug: true,
-	}
-
-	flags := mflag.NewFlagSet("test", mflag.ContinueOnError)
-	loadedConfig, err := loadDaemonCliConfig(c, flags, common, "/tmp/fooobarbaz")
-	if err != nil {
+func defaultOptions(t *testing.T, configFile string) *daemonOptions {
+	opts := newDaemonOptions(&config.Config{})
+	opts.flags = &pflag.FlagSet{}
+	opts.InstallFlags(opts.flags)
+	if err := installConfigFlags(opts.daemonConfig, opts.flags); err != nil {
 		t.Fatal(err)
 	}
-	if loadedConfig == nil {
-		t.Fatalf("expected configuration %v, got nil", c)
-	}
+	defaultDaemonConfigFile, err := getDefaultDaemonConfigFile()
+	assert.NilError(t, err)
+	opts.flags.StringVar(&opts.configFile, "config-file", defaultDaemonConfigFile, "")
+	opts.configFile = configFile
+	return opts
+}
+
+func TestLoadDaemonCliConfigWithoutOverriding(t *testing.T) {
+	opts := defaultOptions(t, "")
+	opts.Debug = true
+
+	loadedConfig, err := loadDaemonCliConfig(opts)
+	assert.NilError(t, err)
+	assert.Assert(t, loadedConfig != nil)
 	if !loadedConfig.Debug {
 		t.Fatalf("expected debug to be copied from the common flags, got false")
 	}
 }
 
 func TestLoadDaemonCliConfigWithTLS(t *testing.T) {
-	c := &daemon.Config{}
-	common := &cliflags.CommonFlags{
-		TLS: true,
-		TLSOptions: &tlsconfig.Options{
-			CAFile: "/tmp/ca.pem",
-		},
-	}
+	opts := defaultOptions(t, "")
+	opts.TLSOptions.CAFile = "/tmp/ca.pem"
+	opts.TLS = true
 
-	flags := mflag.NewFlagSet("test", mflag.ContinueOnError)
-	loadedConfig, err := loadDaemonCliConfig(c, flags, common, "/tmp/fooobarbaz")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if loadedConfig == nil {
-		t.Fatalf("expected configuration %v, got nil", c)
-	}
-	if loadedConfig.CommonTLSOptions.CAFile != "/tmp/ca.pem" {
-		t.Fatalf("expected /tmp/ca.pem, got %s: %q", loadedConfig.CommonTLSOptions.CAFile, loadedConfig)
-	}
+	loadedConfig, err := loadDaemonCliConfig(opts)
+	assert.NilError(t, err)
+	assert.Assert(t, loadedConfig != nil)
+	assert.Check(t, is.Equal("/tmp/ca.pem", loadedConfig.CommonTLSOptions.CAFile))
 }
 
 func TestLoadDaemonCliConfigWithConflicts(t *testing.T) {
-	c := &daemon.Config{}
-	common := &cliflags.CommonFlags{}
-	f, err := ioutil.TempFile("", "docker-config-")
-	if err != nil {
-		t.Fatal(err)
-	}
-	configFile := f.Name()
-	defer os.Remove(configFile)
+	tempFile := fs.NewFile(t, "config", fs.WithContent(`{"labels": ["l3=foo"]}`))
+	defer tempFile.Remove()
+	configFile := tempFile.Path()
 
-	f.Write([]byte(`{"labels": ["l3=foo"]}`))
-	f.Close()
+	opts := defaultOptions(t, configFile)
+	flags := opts.flags
 
-	var labels []string
+	assert.Check(t, flags.Set("config-file", configFile))
+	assert.Check(t, flags.Set("label", "l1=bar"))
+	assert.Check(t, flags.Set("label", "l2=baz"))
 
-	flags := mflag.NewFlagSet("test", mflag.ContinueOnError)
-	flags.String([]string{daemonConfigFileFlag}, "", "")
-	flags.Var(opts.NewNamedListOptsRef("labels", &labels, opts.ValidateLabel), []string{"-label"}, "")
+	_, err := loadDaemonCliConfig(opts)
+	assert.Check(t, is.ErrorContains(err, "as a flag and in the configuration file: labels"))
+}
 
-	flags.Set(daemonConfigFileFlag, configFile)
-	if err := flags.Set("-label", "l1=bar"); err != nil {
-		t.Fatal(err)
-	}
-	if err := flags.Set("-label", "l2=baz"); err != nil {
-		t.Fatal(err)
-	}
+func TestLoadDaemonCliWithConflictingNodeGenericResources(t *testing.T) {
+	tempFile := fs.NewFile(t, "config", fs.WithContent(`{"node-generic-resources": ["foo=bar", "bar=baz"]}`))
+	defer tempFile.Remove()
+	configFile := tempFile.Path()
 
-	_, err = loadDaemonCliConfig(c, flags, common, configFile)
-	if err == nil {
-		t.Fatalf("expected configuration error, got nil")
-	}
-	if !strings.Contains(err.Error(), "labels") {
-		t.Fatalf("expected labels conflict, got %v", err)
-	}
+	opts := defaultOptions(t, configFile)
+	flags := opts.flags
+
+	assert.Check(t, flags.Set("config-file", configFile))
+	assert.Check(t, flags.Set("node-generic-resource", "r1=bar"))
+	assert.Check(t, flags.Set("node-generic-resource", "r2=baz"))
+
+	_, err := loadDaemonCliConfig(opts)
+	assert.Check(t, is.ErrorContains(err, "as a flag and in the configuration file: node-generic-resources"))
+}
+
+func TestLoadDaemonCliWithConflictingLabels(t *testing.T) {
+	opts := defaultOptions(t, "")
+	flags := opts.flags
+
+	assert.Check(t, flags.Set("label", "foo=bar"))
+	assert.Check(t, flags.Set("label", "foo=baz"))
+
+	_, err := loadDaemonCliConfig(opts)
+	assert.Check(t, is.Error(err, "conflict labels for foo=baz and foo=bar"))
+}
+
+func TestLoadDaemonCliWithDuplicateLabels(t *testing.T) {
+	opts := defaultOptions(t, "")
+	flags := opts.flags
+
+	assert.Check(t, flags.Set("label", "foo=the-same"))
+	assert.Check(t, flags.Set("label", "foo=the-same"))
+
+	_, err := loadDaemonCliConfig(opts)
+	assert.Check(t, err)
 }
 
 func TestLoadDaemonCliConfigWithTLSVerify(t *testing.T) {
-	c := &daemon.Config{}
-	common := &cliflags.CommonFlags{
-		TLSOptions: &tlsconfig.Options{
-			CAFile: "/tmp/ca.pem",
-		},
-	}
+	tempFile := fs.NewFile(t, "config", fs.WithContent(`{"tlsverify": true}`))
+	defer tempFile.Remove()
 
-	f, err := ioutil.TempFile("", "docker-config-")
-	if err != nil {
-		t.Fatal(err)
-	}
-	configFile := f.Name()
-	defer os.Remove(configFile)
+	opts := defaultOptions(t, tempFile.Path())
+	opts.TLSOptions.CAFile = "/tmp/ca.pem"
 
-	f.Write([]byte(`{"tlsverify": true}`))
-	f.Close()
-
-	flags := mflag.NewFlagSet("test", mflag.ContinueOnError)
-	flags.Bool([]string{"-tlsverify"}, false, "")
-	loadedConfig, err := loadDaemonCliConfig(c, flags, common, configFile)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if loadedConfig == nil {
-		t.Fatalf("expected configuration %v, got nil", c)
-	}
-
-	if !loadedConfig.TLS {
-		t.Fatalf("expected TLS enabled, got %q", loadedConfig)
-	}
+	loadedConfig, err := loadDaemonCliConfig(opts)
+	assert.NilError(t, err)
+	assert.Assert(t, loadedConfig != nil)
+	assert.Check(t, is.Equal(*loadedConfig.TLS, true))
 }
 
 func TestLoadDaemonCliConfigWithExplicitTLSVerifyFalse(t *testing.T) {
-	c := &daemon.Config{}
-	common := &cliflags.CommonFlags{
-		TLSOptions: &tlsconfig.Options{
-			CAFile: "/tmp/ca.pem",
-		},
-	}
+	tempFile := fs.NewFile(t, "config", fs.WithContent(`{"tlsverify": false}`))
+	defer tempFile.Remove()
 
-	f, err := ioutil.TempFile("", "docker-config-")
-	if err != nil {
-		t.Fatal(err)
-	}
-	configFile := f.Name()
-	defer os.Remove(configFile)
+	opts := defaultOptions(t, tempFile.Path())
+	opts.TLSOptions.CAFile = "/tmp/ca.pem"
 
-	f.Write([]byte(`{"tlsverify": false}`))
-	f.Close()
-
-	flags := mflag.NewFlagSet("test", mflag.ContinueOnError)
-	flags.Bool([]string{"-tlsverify"}, false, "")
-	loadedConfig, err := loadDaemonCliConfig(c, flags, common, configFile)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if loadedConfig == nil {
-		t.Fatalf("expected configuration %v, got nil", c)
-	}
-
-	if !loadedConfig.TLS {
-		t.Fatalf("expected TLS enabled, got %q", loadedConfig)
-	}
+	loadedConfig, err := loadDaemonCliConfig(opts)
+	assert.NilError(t, err)
+	assert.Assert(t, loadedConfig != nil)
+	assert.Check(t, *loadedConfig.TLS)
 }
 
 func TestLoadDaemonCliConfigWithoutTLSVerify(t *testing.T) {
-	c := &daemon.Config{}
-	common := &cliflags.CommonFlags{
-		TLSOptions: &tlsconfig.Options{
-			CAFile: "/tmp/ca.pem",
-		},
-	}
+	tempFile := fs.NewFile(t, "config", fs.WithContent(`{}`))
+	defer tempFile.Remove()
 
-	f, err := ioutil.TempFile("", "docker-config-")
-	if err != nil {
-		t.Fatal(err)
-	}
-	configFile := f.Name()
-	defer os.Remove(configFile)
+	opts := defaultOptions(t, tempFile.Path())
+	opts.TLSOptions.CAFile = "/tmp/ca.pem"
 
-	f.Write([]byte(`{}`))
-	f.Close()
-
-	flags := mflag.NewFlagSet("test", mflag.ContinueOnError)
-	loadedConfig, err := loadDaemonCliConfig(c, flags, common, configFile)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if loadedConfig == nil {
-		t.Fatalf("expected configuration %v, got nil", c)
-	}
-
-	if loadedConfig.TLS {
-		t.Fatalf("expected TLS disabled, got %q", loadedConfig)
-	}
+	loadedConfig, err := loadDaemonCliConfig(opts)
+	assert.NilError(t, err)
+	assert.Assert(t, loadedConfig != nil)
+	assert.Check(t, loadedConfig.TLS == nil)
 }
 
 func TestLoadDaemonCliConfigWithLogLevel(t *testing.T) {
-	c := &daemon.Config{}
-	common := &cliflags.CommonFlags{}
+	tempFile := fs.NewFile(t, "config", fs.WithContent(`{"log-level": "warn"}`))
+	defer tempFile.Remove()
 
-	f, err := ioutil.TempFile("", "docker-config-")
-	if err != nil {
-		t.Fatal(err)
-	}
-	configFile := f.Name()
-	defer os.Remove(configFile)
-
-	f.Write([]byte(`{"log-level": "warn"}`))
-	f.Close()
-
-	flags := mflag.NewFlagSet("test", mflag.ContinueOnError)
-	flags.String([]string{"-log-level"}, "", "")
-	loadedConfig, err := loadDaemonCliConfig(c, flags, common, configFile)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if loadedConfig == nil {
-		t.Fatalf("expected configuration %v, got nil", c)
-	}
-	if loadedConfig.LogLevel != "warn" {
-		t.Fatalf("expected warn log level, got %v", loadedConfig.LogLevel)
-	}
-
-	if logrus.GetLevel() != logrus.WarnLevel {
-		t.Fatalf("expected warn log level, got %v", logrus.GetLevel())
-	}
+	opts := defaultOptions(t, tempFile.Path())
+	loadedConfig, err := loadDaemonCliConfig(opts)
+	assert.NilError(t, err)
+	assert.Assert(t, loadedConfig != nil)
+	assert.Check(t, is.Equal("warn", loadedConfig.LogLevel))
 }
 
 func TestLoadDaemonConfigWithEmbeddedOptions(t *testing.T) {
-	c := &daemon.Config{}
-	common := &cliflags.CommonFlags{}
+	content := `{"tlscacert": "/etc/certs/ca.pem", "log-driver": "syslog"}`
+	tempFile := fs.NewFile(t, "config", fs.WithContent(content))
+	defer tempFile.Remove()
 
-	flags := mflag.NewFlagSet("test", mflag.ContinueOnError)
-	flags.String([]string{"-tlscacert"}, "", "")
-	flags.String([]string{"-log-driver"}, "", "")
-
-	f, err := ioutil.TempFile("", "docker-config-")
-	if err != nil {
-		t.Fatal(err)
-	}
-	configFile := f.Name()
-	defer os.Remove(configFile)
-
-	f.Write([]byte(`{"tlscacert": "/etc/certs/ca.pem", "log-driver": "syslog"}`))
-	f.Close()
-
-	loadedConfig, err := loadDaemonCliConfig(c, flags, common, configFile)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if loadedConfig == nil {
-		t.Fatal("expected configuration, got nil")
-	}
-	if loadedConfig.CommonTLSOptions.CAFile != "/etc/certs/ca.pem" {
-		t.Fatalf("expected CA file path /etc/certs/ca.pem, got %v", loadedConfig.CommonTLSOptions.CAFile)
-	}
-	if loadedConfig.LogConfig.Type != "syslog" {
-		t.Fatalf("expected LogConfig type syslog, got %v", loadedConfig.LogConfig.Type)
-	}
+	opts := defaultOptions(t, tempFile.Path())
+	loadedConfig, err := loadDaemonCliConfig(opts)
+	assert.NilError(t, err)
+	assert.Assert(t, loadedConfig != nil)
+	assert.Check(t, is.Equal("/etc/certs/ca.pem", loadedConfig.CommonTLSOptions.CAFile))
+	assert.Check(t, is.Equal("syslog", loadedConfig.LogConfig.Type))
 }
 
 func TestLoadDaemonConfigWithRegistryOptions(t *testing.T) {
-	c := &daemon.Config{}
-	common := &cliflags.CommonFlags{}
-	flags := mflag.NewFlagSet("test", mflag.ContinueOnError)
-	c.ServiceOptions.InstallCliFlags(flags, absentFromHelp)
+	content := `{
+		"allow-nondistributable-artifacts": ["allow-nondistributable-artifacts.example.com"],
+		"registry-mirrors": ["https://mirrors.example.com"],
+		"insecure-registries": ["https://insecure-registry.example.com"]
+	}`
+	tempFile := fs.NewFile(t, "config", fs.WithContent(content))
+	defer tempFile.Remove()
 
-	f, err := ioutil.TempFile("", "docker-config-")
-	if err != nil {
-		t.Fatal(err)
-	}
-	configFile := f.Name()
-	defer os.Remove(configFile)
+	opts := defaultOptions(t, tempFile.Path())
+	loadedConfig, err := loadDaemonCliConfig(opts)
+	assert.NilError(t, err)
+	assert.Assert(t, loadedConfig != nil)
 
-	f.Write([]byte(`{"registry-mirrors": ["https://mirrors.docker.com"], "insecure-registries": ["https://insecure.docker.com"], "disable-legacy-registry": true}`))
-	f.Close()
+	assert.Check(t, is.Len(loadedConfig.AllowNondistributableArtifacts, 1))
+	assert.Check(t, is.Len(loadedConfig.Mirrors, 1))
+	assert.Check(t, is.Len(loadedConfig.InsecureRegistries, 1))
+}
 
-	loadedConfig, err := loadDaemonCliConfig(c, flags, common, configFile)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if loadedConfig == nil {
-		t.Fatal("expected configuration, got nil")
-	}
+func TestConfigureDaemonLogs(t *testing.T) {
+	conf := &config.Config{}
+	err := configureDaemonLogs(conf)
+	assert.NilError(t, err)
+	assert.Check(t, is.Equal(logrus.InfoLevel, logrus.GetLevel()))
 
-	m := loadedConfig.Mirrors
-	if len(m) != 1 {
-		t.Fatalf("expected 1 mirror, got %d", len(m))
-	}
+	conf.LogLevel = "warn"
+	err = configureDaemonLogs(conf)
+	assert.NilError(t, err)
+	assert.Check(t, is.Equal(logrus.WarnLevel, logrus.GetLevel()))
 
-	r := loadedConfig.InsecureRegistries
-	if len(r) != 1 {
-		t.Fatalf("expected 1 insecure registries, got %d", len(r))
-	}
+	conf.LogLevel = "foobar"
+	err = configureDaemonLogs(conf)
+	assert.Error(t, err, "unable to parse logging level: foobar")
 
-	if !loadedConfig.V2Only {
-		t.Fatal("expected disable-legacy-registry to be true, got false")
-	}
+	// log level should not be changed after a failure
+	assert.Check(t, is.Equal(logrus.WarnLevel, logrus.GetLevel()))
 }

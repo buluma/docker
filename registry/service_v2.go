@@ -1,4 +1,4 @@
-package registry
+package registry // import "github.com/docker/docker/registry"
 
 import (
 	"net/url"
@@ -8,10 +8,8 @@ import (
 )
 
 func (s *DefaultService) lookupV2Endpoints(hostname string) (endpoints []APIEndpoint, err error) {
-	var cfg = tlsconfig.ServerDefault
-	tlsConfig := &cfg
-	if hostname == DefaultNamespace || hostname == DefaultV1Registry.Host {
-		// v2 mirrors
+	tlsConfig := tlsconfig.ServerDefault()
+	if hostname == DefaultNamespace || hostname == IndexHostname {
 		for _, mirror := range s.config.Mirrors {
 			if !strings.HasPrefix(mirror, "http://") && !strings.HasPrefix(mirror, "https://") {
 				mirror = "https://" + mirror
@@ -25,15 +23,13 @@ func (s *DefaultService) lookupV2Endpoints(hostname string) (endpoints []APIEndp
 				return nil, err
 			}
 			endpoints = append(endpoints, APIEndpoint{
-				URL: mirrorURL,
-				// guess mirrors are v2
+				URL:          mirrorURL,
 				Version:      APIVersion2,
 				Mirror:       true,
 				TrimHostname: true,
 				TLSConfig:    mirrorTLSConfig,
 			})
 		}
-		// v2 registry
 		endpoints = append(endpoints, APIEndpoint{
 			URL:          DefaultV2Registry,
 			Version:      APIVersion2,
@@ -45,7 +41,9 @@ func (s *DefaultService) lookupV2Endpoints(hostname string) (endpoints []APIEndp
 		return endpoints, nil
 	}
 
-	tlsConfig, err = s.TLSConfig(hostname)
+	ana := allowNondistributableArtifacts(s.config, hostname)
+
+	tlsConfig, err = s.tlsConfig(hostname)
 	if err != nil {
 		return nil, err
 	}
@@ -56,9 +54,10 @@ func (s *DefaultService) lookupV2Endpoints(hostname string) (endpoints []APIEndp
 				Scheme: "https",
 				Host:   hostname,
 			},
-			Version:      APIVersion2,
-			TrimHostname: true,
-			TLSConfig:    tlsConfig,
+			Version:                        APIVersion2,
+			AllowNondistributableArtifacts: ana,
+			TrimHostname:                   true,
+			TLSConfig:                      tlsConfig,
 		},
 	}
 
@@ -68,8 +67,9 @@ func (s *DefaultService) lookupV2Endpoints(hostname string) (endpoints []APIEndp
 				Scheme: "http",
 				Host:   hostname,
 			},
-			Version:      APIVersion2,
-			TrimHostname: true,
+			Version:                        APIVersion2,
+			AllowNondistributableArtifacts: ana,
+			TrimHostname:                   true,
 			// used to check if supposed to be secure via InsecureSkipVerify
 			TLSConfig: tlsConfig,
 		})

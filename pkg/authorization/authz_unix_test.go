@@ -3,9 +3,10 @@
 // TODO Windows: This uses a Unix socket for testing. This might be possible
 // to port to Windows using a named pipe instead.
 
-package authorization
+package authorization // import "github.com/docker/docker/pkg/authorization"
 
 import (
+	"bytes"
 	"encoding/json"
 	"io/ioutil"
 	"net"
@@ -14,30 +15,30 @@ import (
 	"os"
 	"path"
 	"reflect"
-	"testing"
-
-	"bytes"
 	"strings"
+	"testing"
 
 	"github.com/docker/docker/pkg/plugins"
 	"github.com/docker/go-connections/tlsconfig"
 	"github.com/gorilla/mux"
 )
 
-const pluginAddress = "authzplugin.sock"
+const (
+	pluginAddress = "authz-test-plugin.sock"
+)
 
 func TestAuthZRequestPluginError(t *testing.T) {
 	server := authZPluginTestServer{t: t}
 	server.start()
 	defer server.stop()
 
-	authZPlugin := createTestPlugin(t)
+	authZPlugin := createTestPlugin(t, server.socketAddress())
 
 	request := Request{
 		User:           "user",
 		RequestBody:    []byte("sample body"),
-		RequestURI:     "www.authz.com",
-		RequestMethod:  "GET",
+		RequestURI:     "www.authz.com/auth",
+		RequestMethod:  http.MethodGet,
 		RequestHeaders: map[string]string{"header": "value"},
 	}
 	server.replayResponse = Response{
@@ -50,10 +51,10 @@ func TestAuthZRequestPluginError(t *testing.T) {
 	}
 
 	if !reflect.DeepEqual(server.replayResponse, *actualResponse) {
-		t.Fatalf("Response must be equal")
+		t.Fatal("Response must be equal")
 	}
 	if !reflect.DeepEqual(request, server.recordedRequest) {
-		t.Fatalf("Requests must be equal")
+		t.Fatal("Requests must be equal")
 	}
 }
 
@@ -62,13 +63,13 @@ func TestAuthZRequestPlugin(t *testing.T) {
 	server.start()
 	defer server.stop()
 
-	authZPlugin := createTestPlugin(t)
+	authZPlugin := createTestPlugin(t, server.socketAddress())
 
 	request := Request{
 		User:           "user",
 		RequestBody:    []byte("sample body"),
-		RequestURI:     "www.authz.com",
-		RequestMethod:  "GET",
+		RequestURI:     "www.authz.com/auth",
+		RequestMethod:  http.MethodGet,
 		RequestHeaders: map[string]string{"header": "value"},
 	}
 	server.replayResponse = Response{
@@ -82,10 +83,10 @@ func TestAuthZRequestPlugin(t *testing.T) {
 	}
 
 	if !reflect.DeepEqual(server.replayResponse, *actualResponse) {
-		t.Fatalf("Response must be equal")
+		t.Fatal("Response must be equal")
 	}
 	if !reflect.DeepEqual(request, server.recordedRequest) {
-		t.Fatalf("Requests must be equal")
+		t.Fatal("Requests must be equal")
 	}
 }
 
@@ -94,10 +95,11 @@ func TestAuthZResponsePlugin(t *testing.T) {
 	server.start()
 	defer server.stop()
 
-	authZPlugin := createTestPlugin(t)
+	authZPlugin := createTestPlugin(t, server.socketAddress())
 
 	request := Request{
 		User:        "user",
+		RequestURI:  "something.com/auth",
 		RequestBody: []byte("sample body"),
 	}
 	server.replayResponse = Response{
@@ -111,10 +113,10 @@ func TestAuthZResponsePlugin(t *testing.T) {
 	}
 
 	if !reflect.DeepEqual(server.replayResponse, *actualResponse) {
-		t.Fatalf("Response must be equal")
+		t.Fatal("Response must be equal")
 	}
 	if !reflect.DeepEqual(request, server.recordedRequest) {
-		t.Fatalf("Requests must be equal")
+		t.Fatal("Requests must be equal")
 	}
 }
 
@@ -123,7 +125,7 @@ func TestResponseModifier(t *testing.T) {
 	m := NewResponseModifier(r)
 	m.Header().Set("h1", "v1")
 	m.Write([]byte("body"))
-	m.WriteHeader(500)
+	m.WriteHeader(http.StatusInternalServerError)
 
 	m.FlushAll()
 	if r.Header().Get("h1") != "v1" {
@@ -132,7 +134,7 @@ func TestResponseModifier(t *testing.T) {
 	if !reflect.DeepEqual(r.Body.Bytes(), []byte("body")) {
 		t.Fatalf("Body value must exists %s", r.Body.Bytes())
 	}
-	if r.Code != 500 {
+	if r.Code != http.StatusInternalServerError {
 		t.Fatalf("Status code must be correct %d", r.Code)
 	}
 }
@@ -142,7 +144,7 @@ func TestDrainBody(t *testing.T) {
 		length             int // length is the message length send to drainBody
 		expectedBodyLength int // expectedBodyLength is the expected body length after drainBody is called
 	}{
-		{10, 10}, // Small message size
+		{10, 10},                           // Small message size
 		{maxBodySize - 1, maxBodySize - 1}, // Max message size
 		{maxBodySize * 2, 0},               // Large message size (skip copying body)
 
@@ -158,7 +160,7 @@ func TestDrainBody(t *testing.T) {
 			t.Fatalf("Body must be copied, actual length: '%d'", len(body))
 		}
 		if closer == nil {
-			t.Fatalf("Closer must not be nil")
+			t.Fatal("Closer must not be nil")
 		}
 		modified, err := ioutil.ReadAll(closer)
 		if err != nil {
@@ -170,12 +172,72 @@ func TestDrainBody(t *testing.T) {
 	}
 }
 
+func TestSendBody(t *testing.T) {
+	var (
+		url       = "nothing.com"
+		testcases = []struct {
+			contentType string
+			expected    bool
+		}{
+			{
+				contentType: "application/json",
+				expected:    true,
+			},
+			{
+				contentType: "Application/json",
+				expected:    true,
+			},
+			{
+				contentType: "application/JSON",
+				expected:    true,
+			},
+			{
+				contentType: "APPLICATION/JSON",
+				expected:    true,
+			},
+			{
+				contentType: "application/json; charset=utf-8",
+				expected:    true,
+			},
+			{
+				contentType: "application/json;charset=utf-8",
+				expected:    true,
+			},
+			{
+				contentType: "application/json; charset=UTF8",
+				expected:    true,
+			},
+			{
+				contentType: "application/json;charset=UTF8",
+				expected:    true,
+			},
+			{
+				contentType: "text/html",
+				expected:    false,
+			},
+			{
+				contentType: "",
+				expected:    false,
+			},
+		}
+	)
+
+	for _, testcase := range testcases {
+		header := http.Header{}
+		header.Set("Content-Type", testcase.contentType)
+
+		if b := sendBody(url, header); b != testcase.expected {
+			t.Fatalf("Unexpected Content-Type; Expected: %t, Actual: %t", testcase.expected, b)
+		}
+	}
+}
+
 func TestResponseModifierOverride(t *testing.T) {
 	r := httptest.NewRecorder()
 	m := NewResponseModifier(r)
 	m.Header().Set("h1", "v1")
 	m.Write([]byte("body"))
-	m.WriteHeader(500)
+	m.WriteHeader(http.StatusInternalServerError)
 
 	overrideHeader := make(http.Header)
 	overrideHeader.Add("h1", "v2")
@@ -186,7 +248,7 @@ func TestResponseModifierOverride(t *testing.T) {
 
 	m.OverrideHeader(overrideHeaderBytes)
 	m.OverrideBody([]byte("override body"))
-	m.OverrideStatusCode(404)
+	m.OverrideStatusCode(http.StatusNotFound)
 	m.FlushAll()
 	if r.Header().Get("h1") != "v2" {
 		t.Fatalf("Header value must exists %s", r.Header().Get("h1"))
@@ -194,25 +256,19 @@ func TestResponseModifierOverride(t *testing.T) {
 	if !reflect.DeepEqual(r.Body.Bytes(), []byte("override body")) {
 		t.Fatalf("Body value must exists %s", r.Body.Bytes())
 	}
-	if r.Code != 404 {
+	if r.Code != http.StatusNotFound {
 		t.Fatalf("Status code must be correct %d", r.Code)
 	}
 }
 
 // createTestPlugin creates a new sample authorization plugin
-func createTestPlugin(t *testing.T) *authorizationPlugin {
-	plugin := &plugins.Plugin{Name: "authz"}
-	pwd, err := os.Getwd()
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	plugin.Client, err = plugins.NewClient("unix:///"+path.Join(pwd, pluginAddress), tlsconfig.Options{InsecureSkipVerify: true})
+func createTestPlugin(t *testing.T, socketAddress string) *authorizationPlugin {
+	client, err := plugins.NewClient("unix:///"+socketAddress, &tlsconfig.Options{InsecureSkipVerify: true})
 	if err != nil {
 		t.Fatalf("Failed to create client %v", err)
 	}
 
-	return &authorizationPlugin{name: "plugin", plugin: plugin}
+	return &authorizationPlugin{name: "plugin", plugin: client}
 }
 
 // AuthZPluginTestServer is a simple server that implements the authZ plugin interface
@@ -224,13 +280,26 @@ type authZPluginTestServer struct {
 	// response stores the response sent from the plugin to the daemon
 	replayResponse Response
 	server         *httptest.Server
+	tmpDir         string
+}
+
+func (t *authZPluginTestServer) socketAddress() string {
+	return path.Join(t.tmpDir, pluginAddress)
 }
 
 // start starts the test server that implements the plugin
 func (t *authZPluginTestServer) start() {
+	var err error
+	t.tmpDir, err = ioutil.TempDir("", "authz")
+	if err != nil {
+		t.t.Fatal(err)
+	}
+
 	r := mux.NewRouter()
-	os.Remove(pluginAddress)
-	l, _ := net.ListenUnix("unix", &net.UnixAddr{Name: pluginAddress, Net: "unix"})
+	l, err := net.Listen("unix", t.socketAddress())
+	if err != nil {
+		t.t.Fatal(err)
+	}
 	t.listener = l
 	r.HandleFunc("/Plugin.Activate", t.activate)
 	r.HandleFunc("/"+AuthZApiRequest, t.auth)
@@ -248,7 +317,7 @@ func (t *authZPluginTestServer) start() {
 // stop stops the test server that implements the plugin
 func (t *authZPluginTestServer) stop() {
 	t.server.Close()
-	os.Remove(pluginAddress)
+	_ = os.RemoveAll(t.tmpDir)
 	if t.listener != nil {
 		t.listener.Close()
 	}
@@ -257,14 +326,23 @@ func (t *authZPluginTestServer) stop() {
 // auth is a used to record/replay the authentication api messages
 func (t *authZPluginTestServer) auth(w http.ResponseWriter, r *http.Request) {
 	t.recordedRequest = Request{}
-	body, _ := ioutil.ReadAll(r.Body)
+	body, err := ioutil.ReadAll(r.Body)
+	if err != nil {
+		t.t.Fatal(err)
+	}
 	r.Body.Close()
 	json.Unmarshal(body, &t.recordedRequest)
-	b, _ := json.Marshal(t.replayResponse)
+	b, err := json.Marshal(t.replayResponse)
+	if err != nil {
+		t.t.Fatal(err)
+	}
 	w.Write(b)
 }
 
 func (t *authZPluginTestServer) activate(w http.ResponseWriter, r *http.Request) {
-	b, _ := json.Marshal(plugins.Manifest{Implements: []string{AuthZApiImplements}})
+	b, err := json.Marshal(plugins.Manifest{Implements: []string{AuthZApiImplements}})
+	if err != nil {
+		t.t.Fatal(err)
+	}
 	w.Write(b)
 }

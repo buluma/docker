@@ -1,6 +1,6 @@
-// +build !windows
+// +build !windows,!darwin
 
-package pidfile
+package pidfile // import "github.com/docker/docker/pkg/pidfile"
 
 import (
 	"os"

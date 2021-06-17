@@ -1,13 +1,13 @@
-package daemon
+package daemon // import "github.com/docker/docker/daemon"
 
 import (
 	"testing"
 	"time"
 
+	containertypes "github.com/docker/docker/api/types/container"
+	eventtypes "github.com/docker/docker/api/types/events"
 	"github.com/docker/docker/container"
 	"github.com/docker/docker/daemon/events"
-	containertypes "github.com/docker/engine-api/types/container"
-	eventtypes "github.com/docker/engine-api/types/events"
 )
 
 func TestLogContainerEventCopyLabels(t *testing.T) {
@@ -15,26 +15,24 @@ func TestLogContainerEventCopyLabels(t *testing.T) {
 	_, l, _ := e.Subscribe()
 	defer e.Evict(l)
 
-	container := &container.Container{
-		CommonContainer: container.CommonContainer{
-			ID:   "container_id",
-			Name: "container_name",
-			Config: &containertypes.Config{
-				Image: "image_name",
-				Labels: map[string]string{
-					"node": "1",
-					"os":   "alpine",
-				},
+	ctr := &container.Container{
+		ID:   "container_id",
+		Name: "container_name",
+		Config: &containertypes.Config{
+			Image: "image_name",
+			Labels: map[string]string{
+				"node": "1",
+				"os":   "alpine",
 			},
 		},
 	}
 	daemon := &Daemon{
 		EventsService: e,
 	}
-	daemon.LogContainerEvent(container, "create")
+	daemon.LogContainerEvent(ctr, "create")
 
-	if _, mutated := container.Config.Labels["image"]; mutated {
-		t.Fatalf("Expected to not mutate the container labels, got %q", container.Config.Labels)
+	if _, mutated := ctr.Config.Labels["image"]; mutated {
+		t.Fatalf("Expected to not mutate the container labels, got %q", ctr.Config.Labels)
 	}
 
 	validateTestAttributes(t, l, map[string]string{
@@ -48,15 +46,13 @@ func TestLogContainerEventWithAttributes(t *testing.T) {
 	_, l, _ := e.Subscribe()
 	defer e.Evict(l)
 
-	container := &container.Container{
-		CommonContainer: container.CommonContainer{
-			ID:   "container_id",
-			Name: "container_name",
-			Config: &containertypes.Config{
-				Labels: map[string]string{
-					"node": "1",
-					"os":   "alpine",
-				},
+	ctr := &container.Container{
+		ID:   "container_id",
+		Name: "container_name",
+		Config: &containertypes.Config{
+			Labels: map[string]string{
+				"node": "1",
+				"os":   "alpine",
 			},
 		},
 	}
@@ -67,7 +63,7 @@ func TestLogContainerEventWithAttributes(t *testing.T) {
 		"node": "2",
 		"foo":  "bar",
 	}
-	daemon.LogContainerEventWithAttributes(container, "create", attributes)
+	daemon.LogContainerEventWithAttributes(ctr, "create", attributes)
 
 	validateTestAttributes(t, l, map[string]string{
 		"node": "1",
@@ -89,6 +85,6 @@ func validateTestAttributes(t *testing.T, l chan interface{}, expectedAttributes
 			}
 		}
 	case <-time.After(10 * time.Second):
-		t.Fatalf("LogEvent test timed out")
+		t.Fatal("LogEvent test timed out")
 	}
 }

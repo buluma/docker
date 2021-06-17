@@ -1,30 +1,24 @@
-package container
+package container // import "github.com/docker/docker/api/server/router/container"
 
 import (
 	"github.com/docker/docker/api/server/httputils"
 	"github.com/docker/docker/api/server/router"
 )
 
-type validationError struct {
-	error
-}
-
-func (validationError) IsValidationError() bool {
-	return true
-}
-
 // containerRouter is a router to talk with the container controller
 type containerRouter struct {
 	backend Backend
 	decoder httputils.ContainerDecoder
 	routes  []router.Route
+	cgroup2 bool
 }
 
 // NewRouter initializes a new container router
-func NewRouter(b Backend, decoder httputils.ContainerDecoder) router.Router {
+func NewRouter(b Backend, decoder httputils.ContainerDecoder, cgroup2 bool) router.Router {
 	r := &containerRouter{
 		backend: b,
 		decoder: decoder,
+		cgroup2: cgroup2,
 	}
 	r.initRoutes()
 	return r
@@ -46,8 +40,8 @@ func (r *containerRouter) initRoutes() {
 		router.NewGetRoute("/containers/{name:.*}/changes", r.getContainersChanges),
 		router.NewGetRoute("/containers/{name:.*}/json", r.getContainersByName),
 		router.NewGetRoute("/containers/{name:.*}/top", r.getContainersTop),
-		router.Cancellable(router.NewGetRoute("/containers/{name:.*}/logs", r.getContainersLogs)),
-		router.Cancellable(router.NewGetRoute("/containers/{name:.*}/stats", r.getContainersStats)),
+		router.NewGetRoute("/containers/{name:.*}/logs", r.getContainersLogs),
+		router.NewGetRoute("/containers/{name:.*}/stats", r.getContainersStats),
 		router.NewGetRoute("/containers/{name:.*}/attach/ws", r.wsContainersAttach),
 		router.NewGetRoute("/exec/{id:.*}/json", r.getExecByID),
 		router.NewGetRoute("/containers/{name:.*}/archive", r.getContainersArchive),
@@ -68,6 +62,8 @@ func (r *containerRouter) initRoutes() {
 		router.NewPostRoute("/exec/{name:.*}/resize", r.postContainerExecResize),
 		router.NewPostRoute("/containers/{name:.*}/rename", r.postContainerRename),
 		router.NewPostRoute("/containers/{name:.*}/update", r.postContainerUpdate),
+		router.NewPostRoute("/containers/prune", r.postContainersPrune),
+		router.NewPostRoute("/commit", r.postCommit),
 		// PUT
 		router.NewPutRoute("/containers/{name:.*}/archive", r.putContainersArchive),
 		// DELETE

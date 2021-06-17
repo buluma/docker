@@ -1,39 +1,33 @@
-package daemon
+package daemon // import "github.com/docker/docker/daemon"
 
 import (
+	"context"
 	"fmt"
 
-	"github.com/docker/engine-api/types/container"
+	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/errdefs"
+	"github.com/pkg/errors"
 )
 
 // ContainerUpdate updates configuration of the container
-func (daemon *Daemon) ContainerUpdate(name string, hostConfig *container.HostConfig) ([]string, error) {
+func (daemon *Daemon) ContainerUpdate(name string, hostConfig *container.HostConfig) (container.ContainerUpdateOKBody, error) {
 	var warnings []string
 
-	warnings, err := daemon.verifyContainerSettings(hostConfig, nil, true)
+	c, err := daemon.GetContainer(name)
 	if err != nil {
-		return warnings, err
+		return container.ContainerUpdateOKBody{Warnings: warnings}, err
+	}
+
+	warnings, err = daemon.verifyContainerSettings(c.OS, hostConfig, nil, true)
+	if err != nil {
+		return container.ContainerUpdateOKBody{Warnings: warnings}, errdefs.InvalidParameter(err)
 	}
 
 	if err := daemon.update(name, hostConfig); err != nil {
-		return warnings, err
+		return container.ContainerUpdateOKBody{Warnings: warnings}, err
 	}
 
-	return warnings, nil
-}
-
-// ContainerUpdateCmdOnBuild updates Path and Args for the container with ID cID.
-func (daemon *Daemon) ContainerUpdateCmdOnBuild(cID string, cmd []string) error {
-	if len(cmd) == 0 {
-		return nil
-	}
-	c, err := daemon.GetContainer(cID)
-	if err != nil {
-		return err
-	}
-	c.Path = cmd[0]
-	c.Args = cmd[1:]
-	return nil
+	return container.ContainerUpdateOKBody{Warnings: warnings}, nil
 }
 
 func (daemon *Daemon) update(name string, hostConfig *container.HostConfig) error {
@@ -41,54 +35,67 @@ func (daemon *Daemon) update(name string, hostConfig *container.HostConfig) erro
 		return nil
 	}
 
-	container, err := daemon.GetContainer(name)
+	ctr, err := daemon.GetContainer(name)
 	if err != nil {
 		return err
 	}
 
 	restoreConfig := false
-	backupHostConfig := *container.HostConfig
+	backupHostConfig := *ctr.HostConfig
+
 	defer func() {
 		if restoreConfig {
-			container.Lock()
-			container.HostConfig = &backupHostConfig
-			container.ToDisk()
-			container.Unlock()
+			ctr.Lock()
+			if !ctr.RemovalInProgress && !ctr.Dead {
+				ctr.HostConfig = &backupHostConfig
+				ctr.CheckpointTo(daemon.containersReplica)
+			}
+			ctr.Unlock()
 		}
 	}()
 
-	if container.RemovalInProgress || container.Dead {
-		return errCannotUpdate(container.ID, fmt.Errorf("Container is marked for removal and cannot be \"update\"."))
+	ctr.Lock()
+
+	if ctr.RemovalInProgress || ctr.Dead {
+		ctr.Unlock()
+		return errCannotUpdate(ctr.ID, fmt.Errorf("container is marked for removal and cannot be \"update\""))
 	}
 
-	if container.IsRunning() && hostConfig.KernelMemory != 0 {
-		return errCannotUpdate(container.ID, fmt.Errorf("Can not update kernel memory to a running container, please stop it first."))
-	}
-
-	if err := container.UpdateContainer(hostConfig); err != nil {
+	if err := ctr.UpdateContainer(hostConfig); err != nil {
 		restoreConfig = true
-		return errCannotUpdate(container.ID, err)
+		ctr.Unlock()
+		return errCannotUpdate(ctr.ID, err)
 	}
+	if err := ctr.CheckpointTo(daemon.containersReplica); err != nil {
+		restoreConfig = true
+		ctr.Unlock()
+		return errCannotUpdate(ctr.ID, err)
+	}
+
+	ctr.Unlock()
 
 	// if Restart Policy changed, we need to update container monitor
-	container.UpdateMonitor(hostConfig.RestartPolicy)
+	if hostConfig.RestartPolicy.Name != "" {
+		ctr.UpdateMonitor(hostConfig.RestartPolicy)
+	}
 
 	// If container is not running, update hostConfig struct is enough,
 	// resources will be updated when the container is started again.
 	// If container is running (including paused), we need to update configs
 	// to the real world.
-	if container.IsRunning() && !container.IsRestarting() {
-		if err := daemon.containerd.UpdateResources(container.ID, toContainerdResources(hostConfig.Resources)); err != nil {
+	if ctr.IsRunning() && !ctr.IsRestarting() {
+		if err := daemon.containerd.UpdateResources(context.Background(), ctr.ID, toContainerdResources(hostConfig.Resources)); err != nil {
 			restoreConfig = true
-			return errCannotUpdate(container.ID, err)
+			// TODO: it would be nice if containerd responded with better errors here so we can classify this better.
+			return errCannotUpdate(ctr.ID, errdefs.System(err))
 		}
 	}
 
-	daemon.LogContainerEvent(container, "update")
+	daemon.LogContainerEvent(ctr, "update")
 
 	return nil
 }
 
 func errCannotUpdate(containerID string, err error) error {
-	return fmt.Errorf("Cannot update container %s: %v", containerID, err)
+	return errors.Wrap(err, "Cannot update container "+containerID)
 }
