@@ -1,36 +1,49 @@
-package daemon
+package daemon // import "github.com/docker/docker/daemon"
 
 import (
-	"fmt"
-	"net/http"
+	"context"
 	"runtime"
-	"strings"
-	"syscall"
+	"time"
 
-	"google.golang.org/grpc"
-
-	"github.com/Sirupsen/logrus"
+	"github.com/docker/docker/api/types"
+	containertypes "github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/container"
-	"github.com/docker/docker/errors"
-	"github.com/docker/docker/libcontainerd"
-	"github.com/docker/docker/runconfig"
-	containertypes "github.com/docker/engine-api/types/container"
+	"github.com/docker/docker/errdefs"
+	"github.com/pkg/errors"
+	"github.com/sirupsen/logrus"
 )
 
 // ContainerStart starts a container.
-func (daemon *Daemon) ContainerStart(name string, hostConfig *containertypes.HostConfig) error {
-	container, err := daemon.GetContainer(name)
+func (daemon *Daemon) ContainerStart(name string, hostConfig *containertypes.HostConfig, checkpoint string, checkpointDir string) error {
+	if checkpoint != "" && !daemon.HasExperimental() {
+		return errdefs.InvalidParameter(errors.New("checkpoint is only supported in experimental mode"))
+	}
+
+	ctr, err := daemon.GetContainer(name)
 	if err != nil {
 		return err
 	}
 
-	if container.IsPaused() {
-		return fmt.Errorf("Cannot start a paused container, try unpause instead.")
+	validateState := func() error {
+		ctr.Lock()
+		defer ctr.Unlock()
+
+		if ctr.Paused {
+			return errdefs.Conflict(errors.New("cannot start a paused container, try unpause instead"))
+		}
+
+		if ctr.Running {
+			return containerNotModifiedError{running: true}
+		}
+
+		if ctr.RemovalInProgress || ctr.Dead {
+			return errdefs.Conflict(errors.New("container is marked for removal and cannot be started"))
+		}
+		return nil
 	}
 
-	if container.IsRunning() {
-		err := fmt.Errorf("Container already started")
-		return errors.NewErrorWithStatusCode(err, http.StatusNotModified)
+	if err := validateState(); err != nil {
+		return err
 	}
 
 	// Windows does not have the backwards compatibility issue here.
@@ -38,67 +51,69 @@ func (daemon *Daemon) ContainerStart(name string, hostConfig *containertypes.Hos
 		// This is kept for backward compatibility - hostconfig should be passed when
 		// creating a container, not during start.
 		if hostConfig != nil {
-			logrus.Warn("DEPRECATED: Setting host configuration options when the container starts is deprecated and will be removed in Docker 1.12")
-			oldNetworkMode := container.HostConfig.NetworkMode
-			if err := daemon.setSecurityOptions(container, hostConfig); err != nil {
-				return err
+			logrus.Warn("DEPRECATED: Setting host configuration options when the container starts is deprecated and has been removed in Docker 1.12")
+			oldNetworkMode := ctr.HostConfig.NetworkMode
+			if err := daemon.setSecurityOptions(ctr, hostConfig); err != nil {
+				return errdefs.InvalidParameter(err)
 			}
 			if err := daemon.mergeAndVerifyLogConfig(&hostConfig.LogConfig); err != nil {
-				return err
+				return errdefs.InvalidParameter(err)
 			}
-			if err := daemon.setHostConfig(container, hostConfig); err != nil {
-				return err
+			if err := daemon.setHostConfig(ctr, hostConfig); err != nil {
+				return errdefs.InvalidParameter(err)
 			}
-			newNetworkMode := container.HostConfig.NetworkMode
+			newNetworkMode := ctr.HostConfig.NetworkMode
 			if string(oldNetworkMode) != string(newNetworkMode) {
 				// if user has change the network mode on starting, clean up the
-				// old networks. It is a deprecated feature and will be removed in Docker 1.12
-				container.NetworkSettings.Networks = nil
-				if err := container.ToDisk(); err != nil {
-					return err
+				// old networks. It is a deprecated feature and has been removed in Docker 1.12
+				ctr.NetworkSettings.Networks = nil
+				if err := ctr.CheckpointTo(daemon.containersReplica); err != nil {
+					return errdefs.System(err)
 				}
 			}
-			container.InitDNSHostConfig()
+			ctr.InitDNSHostConfig()
 		}
 	} else {
 		if hostConfig != nil {
-			return fmt.Errorf("Supplying a hostconfig on start is not supported. It should be supplied on create")
+			return errdefs.InvalidParameter(errors.New("Supplying a hostconfig on start is not supported. It should be supplied on create"))
 		}
 	}
 
 	// check if hostConfig is in line with the current system settings.
 	// It may happen cgroups are umounted or the like.
-	if _, err = daemon.verifyContainerSettings(container.HostConfig, nil, false); err != nil {
-		return err
+	if _, err = daemon.verifyContainerSettings(ctr.OS, ctr.HostConfig, nil, false); err != nil {
+		return errdefs.InvalidParameter(err)
 	}
 	// Adapt for old containers in case we have updates in this function and
 	// old containers never have chance to call the new function in create stage.
-	if err := daemon.adaptContainerSettings(container.HostConfig, false); err != nil {
-		return err
+	if hostConfig != nil {
+		if err := daemon.adaptContainerSettings(ctr.HostConfig, false); err != nil {
+			return errdefs.InvalidParameter(err)
+		}
 	}
-
-	return daemon.containerStart(container)
-}
-
-// Start starts a container
-func (daemon *Daemon) Start(container *container.Container) error {
-	return daemon.containerStart(container)
+	return daemon.containerStart(ctr, checkpoint, checkpointDir, true)
 }
 
 // containerStart prepares the container to run by setting up everything the
 // container needs, such as storage and networking, as well as links
 // between containers. The container is left waiting for a signal to
 // begin running.
-func (daemon *Daemon) containerStart(container *container.Container) (err error) {
+func (daemon *Daemon) containerStart(container *container.Container, checkpoint string, checkpointDir string, resetRestartManager bool) (err error) {
+	start := time.Now()
 	container.Lock()
 	defer container.Unlock()
 
-	if container.Running {
+	if resetRestartManager && container.Running { // skip this check if already in restarting step and resetRestartManager==false
 		return nil
 	}
 
 	if container.RemovalInProgress || container.Dead {
-		return fmt.Errorf("Container is marked for removal and cannot be started.")
+		return errdefs.Conflict(errors.New("container is marked for removal and cannot be started"))
+	}
+
+	if checkpointDir != "" {
+		// TODO(mlaventure): how would we support that?
+		return errdefs.Forbidden(errors.New("custom checkpointdir is not supported"))
 	}
 
 	// if we encounter an error during start we need to ensure that any other
@@ -107,11 +122,23 @@ func (daemon *Daemon) containerStart(container *container.Container) (err error)
 		if err != nil {
 			container.SetError(err)
 			// if no one else has set it, make sure we don't leave it at zero
-			if container.ExitCode == 0 {
-				container.ExitCode = 128
+			if container.ExitCode() == 0 {
+				container.SetExitCode(128)
 			}
-			container.ToDisk()
+			if err := container.CheckpointTo(daemon.containersReplica); err != nil {
+				logrus.Errorf("%s: failed saving state on start failure: %v", container.ID, err)
+			}
+			container.Reset(false)
+
 			daemon.Cleanup(container)
+			// if containers AutoRemove flag is set, remove it after clean up
+			if container.HostConfig.AutoRemove {
+				container.Unlock()
+				if err := daemon.ContainerRm(container.ID, &types.ContainerRmConfig{ForceRemove: true, RemoveVolume: true}); err != nil {
+					logrus.Errorf("can't remove container %s: %v", container.ID, err)
+				}
+				container.Lock()
+			}
 		}
 	}()
 
@@ -119,39 +146,79 @@ func (daemon *Daemon) containerStart(container *container.Container) (err error)
 		return err
 	}
 
-	// Make sure NetworkMode has an acceptable value. We do this to ensure
-	// backwards API compatibility.
-	container.HostConfig = runconfig.SetDefaultNetModeIfBlank(container.HostConfig)
-
 	if err := daemon.initializeNetworking(container); err != nil {
 		return err
 	}
 
 	spec, err := daemon.createSpec(container)
 	if err != nil {
+		return errdefs.System(err)
+	}
+
+	if resetRestartManager {
+		container.ResetRestartManager(true)
+		container.HasBeenManuallyStopped = false
+	}
+
+	if err := daemon.saveAppArmorConfig(container); err != nil {
 		return err
 	}
 
-	if err := daemon.containerd.Create(container.ID, *spec, libcontainerd.WithRestartManager(container.RestartManager(true))); err != nil {
-		errDesc := grpc.ErrorDesc(err)
-		logrus.Errorf("Create container failed with error: %s", errDesc)
-		// if we receive an internal error from the initial start of a container then lets
-		// return it instead of entering the restart loop
-		// set to 127 for container cmd not found/does not exist)
-		if strings.Contains(errDesc, "executable file not found") ||
-			strings.Contains(errDesc, "no such file or directory") ||
-			strings.Contains(errDesc, "system cannot find the file specified") {
-			container.ExitCode = 127
+	if checkpoint != "" {
+		checkpointDir, err = getCheckpointDir(checkpointDir, checkpoint, container.Name, container.ID, container.CheckpointDir(), false)
+		if err != nil {
+			return err
 		}
-		// set to 126 for container cmd can't be invoked errors
-		if strings.Contains(errDesc, syscall.EACCES.Error()) {
-			container.ExitCode = 126
-		}
-
-		container.Reset(false)
-
-		return fmt.Errorf("%s", errDesc)
 	}
+
+	shim, createOptions, err := daemon.getLibcontainerdCreateOptions(container)
+	if err != nil {
+		return err
+	}
+
+	ctx := context.TODO()
+
+	err = daemon.containerd.Create(ctx, container.ID, spec, shim, createOptions)
+	if err != nil {
+		if errdefs.IsConflict(err) {
+			logrus.WithError(err).WithField("container", container.ID).Error("Container not cleaned up from containerd from previous run")
+			// best effort to clean up old container object
+			daemon.containerd.DeleteTask(ctx, container.ID)
+			if err := daemon.containerd.Delete(ctx, container.ID); err != nil && !errdefs.IsNotFound(err) {
+				logrus.WithError(err).WithField("container", container.ID).Error("Error cleaning up stale containerd container object")
+			}
+			err = daemon.containerd.Create(ctx, container.ID, spec, shim, createOptions)
+		}
+		if err != nil {
+			return translateContainerdStartErr(container.Path, container.SetExitCode, err)
+		}
+	}
+
+	// TODO(mlaventure): we need to specify checkpoint options here
+	pid, err := daemon.containerd.Start(context.Background(), container.ID, checkpointDir,
+		container.StreamConfig.Stdin() != nil || container.Config.Tty,
+		container.InitializeStdio)
+	if err != nil {
+		if err := daemon.containerd.Delete(context.Background(), container.ID); err != nil {
+			logrus.WithError(err).WithField("container", container.ID).
+				Error("failed to delete failed start container")
+		}
+		return translateContainerdStartErr(container.Path, container.SetExitCode, err)
+	}
+
+	container.SetRunning(pid, true)
+	container.HasBeenStartedBefore = true
+	daemon.setStateCounter(container)
+
+	daemon.initHealthMonitor(container)
+
+	if err := container.CheckpointTo(daemon.containersReplica); err != nil {
+		logrus.WithError(err).WithField("container", container.ID).
+			Errorf("failed to store container")
+	}
+
+	daemon.LogContainerEvent(container, "start")
+	containerActions.WithValues("start").UpdateSince(start)
 
 	return nil
 }
@@ -161,24 +228,39 @@ func (daemon *Daemon) containerStart(container *container.Container) (err error)
 func (daemon *Daemon) Cleanup(container *container.Container) {
 	daemon.releaseNetwork(container)
 
-	container.UnmountIpcMounts(detachMounted)
+	if err := container.UnmountIpcMount(); err != nil {
+		logrus.Warnf("%s cleanup: failed to unmount IPC: %s", container.ID, err)
+	}
 
 	if err := daemon.conditionalUnmountOnCleanup(container); err != nil {
 		// FIXME: remove once reference counting for graphdrivers has been refactored
 		// Ensure that all the mounts are gone
-		if mountid, err := daemon.layerStore.GetMountID(container.ID); err == nil {
+		if mountid, err := daemon.imageService.GetLayerMountID(container.ID); err == nil {
 			daemon.cleanupMountsByID(mountid)
 		}
+	}
+
+	if err := container.UnmountSecrets(); err != nil {
+		logrus.Warnf("%s cleanup: failed to unmount secrets: %s", container.ID, err)
+	}
+
+	if err := recursiveUnmount(container.Root); err != nil {
+		logrus.WithError(err).WithField("container", container.ID).Warn("Error while cleaning up container resource mounts.")
 	}
 
 	for _, eConfig := range container.ExecCommands.Commands() {
 		daemon.unregisterExecCommand(container, eConfig)
 	}
 
-	if container.BaseFS != "" {
-		if err := container.UnmountVolumes(false, daemon.LogVolumeEvent); err != nil {
+	if container.BaseFS != nil && container.BaseFS.Path() != "" {
+		if err := container.UnmountVolumes(daemon.LogVolumeEvent); err != nil {
 			logrus.Warnf("%s cleanup: Failed to umount volumes: %v", container.ID, err)
 		}
 	}
+
 	container.CancelAttachContext()
+
+	if err := daemon.containerd.Delete(context.Background(), container.ID); err != nil {
+		logrus.Errorf("%s cleanup: failed to delete container from containerd: %v", container.ID, err)
+	}
 }

@@ -1,10 +1,10 @@
-package registry
+package registry // import "github.com/docker/docker/registry"
 
 import (
 	"testing"
 
-	"github.com/docker/engine-api/types"
-	registrytypes "github.com/docker/engine-api/types/registry"
+	"github.com/docker/docker/api/types"
+	registrytypes "github.com/docker/docker/api/types/registry"
 )
 
 func buildAuthConfigs() map[string]types.AuthConfig {
@@ -18,20 +18,6 @@ func buildAuthConfigs() map[string]types.AuthConfig {
 	}
 
 	return authConfigs
-}
-
-func TestSameAuthDataPostSave(t *testing.T) {
-	authConfigs := buildAuthConfigs()
-	authConfig := authConfigs["testIndex"]
-	if authConfig.Username != "docker-user" {
-		t.Fail()
-	}
-	if authConfig.Password != "docker-pass" {
-		t.Fail()
-	}
-	if authConfig.Auth != "" {
-		t.Fail()
-	}
 }
 
 func TestResolveAuthConfigIndexServer(t *testing.T) {
@@ -72,7 +58,7 @@ func TestResolveAuthConfigFullURL(t *testing.T) {
 	expectedAuths := map[string]types.AuthConfig{
 		"registry.example.com": registryAuth,
 		"localhost:8000":       localAuth,
-		"registry.com":         localAuth,
+		"example.com":          localAuth,
 	}
 
 	validRegistries := map[string][]string{
@@ -88,11 +74,11 @@ func TestResolveAuthConfigFullURL(t *testing.T) {
 			"localhost:8000",
 			"localhost:8000/v1/",
 		},
-		"registry.com": {
-			"https://registry.com/v1/",
-			"http://registry.com/v1/",
-			"registry.com",
-			"registry.com/v1/",
+		"example.com": {
+			"https://example.com/v1/",
+			"http://example.com/v1/",
+			"example.com",
+			"example.com/v1/",
 		},
 	}
 

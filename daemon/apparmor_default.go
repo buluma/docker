@@ -1,30 +1,45 @@
 // +build linux
 
-package daemon
+package daemon // import "github.com/docker/docker/daemon"
 
 import (
-	"github.com/Sirupsen/logrus"
+	"fmt"
+
+	"github.com/containerd/containerd/pkg/apparmor"
 	aaprofile "github.com/docker/docker/profiles/apparmor"
-	"github.com/opencontainers/runc/libcontainer/apparmor"
 )
 
 // Define constants for native driver
 const (
-	defaultApparmorProfile = "docker-default"
+	unconfinedAppArmorProfile = "unconfined"
+	defaultAppArmorProfile    = "docker-default"
 )
 
-func installDefaultAppArmorProfile() {
-	if apparmor.IsEnabled() {
-		if err := aaprofile.InstallDefault(defaultApparmorProfile); err != nil {
-			apparmorProfiles := []string{defaultApparmorProfile}
+// DefaultApparmorProfile returns the name of the default apparmor profile
+func DefaultApparmorProfile() string {
+	if apparmor.HostSupports() {
+		return defaultAppArmorProfile
+	}
+	return ""
+}
 
-			// Allow daemon to run if loading failed, but are active
-			// (possibly through another run, manually, or via system startup)
-			for _, policy := range apparmorProfiles {
-				if err := aaprofile.IsLoaded(policy); err != nil {
-					logrus.Errorf("AppArmor enabled on system but the %s profile could not be loaded.", policy)
-				}
-			}
+func ensureDefaultAppArmorProfile() error {
+	if apparmor.HostSupports() {
+		loaded, err := aaprofile.IsLoaded(defaultAppArmorProfile)
+		if err != nil {
+			return fmt.Errorf("Could not check if %s AppArmor profile was loaded: %s", defaultAppArmorProfile, err)
+		}
+
+		// Nothing to do.
+		if loaded {
+			return nil
+		}
+
+		// Load the profile.
+		if err := aaprofile.InstallDefault(defaultAppArmorProfile); err != nil {
+			return fmt.Errorf("AppArmor enabled on system but the %s profile could not be loaded: %s", defaultAppArmorProfile, err)
 		}
 	}
+
+	return nil
 }

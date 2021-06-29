@@ -1,6 +1,12 @@
 // +build !linux
 
-package daemon
+package daemon // import "github.com/docker/docker/daemon"
 
-func installDefaultAppArmorProfile() {
+func ensureDefaultAppArmorProfile() error {
+	return nil
+}
+
+// DefaultApparmorProfile returns an empty string.
+func DefaultApparmorProfile() string {
+	return ""
 }

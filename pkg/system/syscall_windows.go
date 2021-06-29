@@ -1,27 +1,31 @@
-package system
+package system // import "github.com/docker/docker/pkg/system"
 
 import (
-	"syscall"
 	"unsafe"
 
-	"github.com/Sirupsen/logrus"
+	"github.com/sirupsen/logrus"
+	"golang.org/x/sys/windows"
+)
+
+const (
+	// Deprecated: use github.com/docker/pkg/idtools.SeTakeOwnershipPrivilege
+	SeTakeOwnershipPrivilege = "SeTakeOwnershipPrivilege"
+)
+
+const (
+	// Deprecated: use github.com/docker/pkg/idtools.ContainerAdministratorSidString
+	ContainerAdministratorSidString = "S-1-5-93-2-1"
+	// Deprecated: use github.com/docker/pkg/idtools.ContainerUserSidString
+	ContainerUserSidString = "S-1-5-93-2-2"
 )
 
 var (
-	ntuserApiset      = syscall.NewLazyDLL("ext-ms-win-ntuser-window-l1-1-0")
+	ntuserApiset      = windows.NewLazyDLL("ext-ms-win-ntuser-window-l1-1-0")
 	procGetVersionExW = modkernel32.NewProc("GetVersionExW")
 )
 
-// OSVersion is a wrapper for Windows version information
-// https://msdn.microsoft.com/en-us/library/windows/desktop/ms724439(v=vs.85).aspx
-type OSVersion struct {
-	Version      uint32
-	MajorVersion uint8
-	MinorVersion uint8
-	Build        uint16
-}
-
-// https://msdn.microsoft.com/en-us/library/windows/desktop/ms724833(v=vs.85).aspx
+// https://docs.microsoft.com/en-us/windows/win32/api/winnt/ns-winnt-osversioninfoexa
+// TODO: use golang.org/x/sys/windows.OsVersionInfoEx (needs OSVersionInfoSize to be exported)
 type osVersionInfoEx struct {
 	OSVersionInfoSize uint32
 	MajorVersion      uint32
@@ -36,61 +40,19 @@ type osVersionInfoEx struct {
 	Reserve           byte
 }
 
-// GetOSVersion gets the operating system version on Windows. Note that
-// docker.exe must be manifested to get the correct version information.
-func GetOSVersion() OSVersion {
-	var err error
-	osv := OSVersion{}
-	osv.Version, err = syscall.GetVersion()
-	if err != nil {
-		// GetVersion never fails.
-		panic(err)
-	}
-	osv.MajorVersion = uint8(osv.Version & 0xFF)
-	osv.MinorVersion = uint8(osv.Version >> 8 & 0xFF)
-	osv.Build = uint16(osv.Version >> 16)
-	return osv
-}
-
-// IsWindowsClient returns true if the SKU is client
+// IsWindowsClient returns true if the SKU is client. It returns false on
+// Windows server, or if an error occurred when making the GetVersionExW
+// syscall.
 func IsWindowsClient() bool {
 	osviex := &osVersionInfoEx{OSVersionInfoSize: 284}
 	r1, _, err := procGetVersionExW.Call(uintptr(unsafe.Pointer(osviex)))
 	if r1 == 0 {
-		logrus.Warnf("GetVersionExW failed - assuming server SKU: %v", err)
+		logrus.WithError(err).Warn("GetVersionExW failed - assuming server SKU")
 		return false
 	}
-	const verNTWorkstation = 0x00000001
+	// VER_NT_WORKSTATION, see https://docs.microsoft.com/en-us/windows/win32/api/winnt/ns-winnt-osversioninfoexa
+	const verNTWorkstation = 0x00000001 // VER_NT_WORKSTATION
 	return osviex.ProductType == verNTWorkstation
-}
-
-// Unmount is a platform-specific helper function to call
-// the unmount syscall. Not supported on Windows
-func Unmount(dest string) error {
-	return nil
-}
-
-// CommandLineToArgv wraps the Windows syscall to turn a commandline into an argument array.
-func CommandLineToArgv(commandLine string) ([]string, error) {
-	var argc int32
-
-	argsPtr, err := syscall.UTF16PtrFromString(commandLine)
-	if err != nil {
-		return nil, err
-	}
-
-	argv, err := syscall.CommandLineToArgv(argsPtr, &argc)
-	if err != nil {
-		return nil, err
-	}
-	defer syscall.LocalFree(syscall.Handle(uintptr(unsafe.Pointer(argv))))
-
-	newArgs := make([]string, argc)
-	for i, v := range (*argv)[:argc] {
-		newArgs[i] = string(syscall.UTF16ToString((*v)[:]))
-	}
-
-	return newArgs, nil
 }
 
 // HasWin32KSupport determines whether containers that depend on win32k can

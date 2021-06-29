@@ -1,6 +1,6 @@
 // Package signal provides helper functions for dealing with signals across
 // various operating systems.
-package signal
+package signal // import "github.com/docker/docker/pkg/signal"
 
 import (
 	"fmt"
@@ -12,9 +12,16 @@ import (
 )
 
 // CatchAll catches all signals and relays them to the specified channel.
+// SIGURG is not handled, as it's used by the Go runtime to support
+// preemptable system calls.
 func CatchAll(sigc chan os.Signal) {
-	handledSigs := []os.Signal{}
-	for _, s := range SignalMap {
+	var handledSigs []os.Signal
+	for n, s := range SignalMap {
+		if n == "URG" {
+			// Do not handle SIGURG, as in go1.14+, the go runtime issues
+			// SIGURG as an interrupt to support preemptable system calls on Linux.
+			continue
+		}
 		handledSigs = append(handledSigs, s)
 	}
 	signal.Notify(sigc, handledSigs...)

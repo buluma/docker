@@ -4,79 +4,97 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/Sirupsen/logrus"
+	"github.com/docker/docker/cli"
+	"github.com/docker/docker/daemon/config"
 	"github.com/docker/docker/dockerversion"
-	flag "github.com/docker/docker/pkg/mflag"
+	"github.com/docker/docker/pkg/jsonmessage"
 	"github.com/docker/docker/pkg/reexec"
-	"github.com/docker/docker/pkg/term"
-	"github.com/docker/docker/utils"
+	"github.com/docker/docker/rootless"
+	"github.com/moby/buildkit/util/apicaps"
+	"github.com/moby/term"
+	"github.com/sirupsen/logrus"
+	"github.com/spf13/cobra"
 )
 
 var (
-	daemonCli = NewDaemonCli()
-	flHelp    = flag.Bool([]string{"h", "-help"}, false, "Print usage")
-	flVersion = flag.Bool([]string{"v", "-version"}, false, "Print version information and quit")
+	honorXDG bool
 )
+
+func newDaemonCommand() (*cobra.Command, error) {
+	opts := newDaemonOptions(config.New())
+
+	cmd := &cobra.Command{
+		Use:           "dockerd [OPTIONS]",
+		Short:         "A self-sufficient runtime for containers.",
+		SilenceUsage:  true,
+		SilenceErrors: true,
+		Args:          cli.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			opts.flags = cmd.Flags()
+			return runDaemon(opts)
+		},
+		DisableFlagsInUseLine: true,
+		Version:               fmt.Sprintf("%s, build %s", dockerversion.Version, dockerversion.GitCommit),
+	}
+	cli.SetupRootCommand(cmd)
+
+	flags := cmd.Flags()
+	flags.BoolP("version", "v", false, "Print version information and quit")
+	defaultDaemonConfigFile, err := getDefaultDaemonConfigFile()
+	if err != nil {
+		return nil, err
+	}
+	flags.StringVar(&opts.configFile, "config-file", defaultDaemonConfigFile, "Daemon configuration file")
+	opts.InstallFlags(flags)
+	if err := installConfigFlags(opts.daemonConfig, flags); err != nil {
+		return nil, err
+	}
+	installServiceFlags(flags)
+
+	return cmd, nil
+}
+
+func init() {
+	if dockerversion.ProductName != "" {
+		apicaps.ExportedProduct = dockerversion.ProductName
+	}
+	// When running with RootlessKit, $XDG_RUNTIME_DIR, $XDG_DATA_HOME, and $XDG_CONFIG_HOME needs to be
+	// honored as the default dirs, because we are unlikely to have permissions to access the system-wide
+	// directories.
+	//
+	// Note that even running with --rootless, when not running with RootlessKit, honorXDG needs to be kept false,
+	// because the system-wide directories in the current mount namespace are expected to be accessible.
+	// ("rootful" dockerd in rootless dockerd, #38702)
+	honorXDG = rootless.RunningWithRootlessKit()
+}
 
 func main() {
 	if reexec.Init() {
 		return
 	}
 
+	// initial log formatting; this setting is updated after the daemon configuration is loaded.
+	logrus.SetFormatter(&logrus.TextFormatter{
+		TimestampFormat: jsonmessage.RFC3339NanoFixed,
+		FullTimestamp:   true,
+	})
+
 	// Set terminal emulation based on platform as required.
 	_, stdout, stderr := term.StdStreams()
 
-	logrus.SetOutput(stderr)
+	initLogging(stdout, stderr)
 
-	flag.Merge(flag.CommandLine, daemonCli.commonFlags.FlagSet)
-
-	flag.Usage = func() {
-		fmt.Fprint(stdout, "Usage: dockerd [ --help | -v | --version ]\n\n")
-		fmt.Fprint(stdout, "A self-sufficient runtime for containers.\n\nOptions:\n")
-
-		flag.CommandLine.SetOutput(stdout)
-		flag.PrintDefaults()
-	}
-	flag.CommandLine.ShortUsage = func() {
-		fmt.Fprint(stderr, "\nUsage:\tdockerd [OPTIONS]\n")
-	}
-
-	if err := flag.CommandLine.ParseFlags(os.Args[1:], false); err != nil {
+	onError := func(err error) {
+		fmt.Fprintf(stderr, "%s\n", err)
 		os.Exit(1)
 	}
 
-	if *flVersion {
-		showVersion()
-		return
-	}
-
-	if *flHelp {
-		// if global flag --help is present, regardless of what other options and commands there are,
-		// just print the usage.
-		flag.Usage()
-		return
-	}
-
-	// On Windows, this may be launching as a service or with an option to
-	// register the service.
-	stop, err := initService()
+	cmd, err := newDaemonCommand()
 	if err != nil {
-		logrus.Fatal(err)
+		onError(err)
 	}
-
-	if !stop {
-		err = daemonCli.start()
-		notifyShutdown(err)
-		if err != nil {
-			logrus.Fatal(err)
-		}
-	}
-}
-
-func showVersion() {
-	if utils.ExperimentalBuild() {
-		fmt.Printf("Docker version %s, build %s, experimental\n", dockerversion.Version, dockerversion.GitCommit)
-	} else {
-		fmt.Printf("Docker version %s, build %s\n", dockerversion.Version, dockerversion.GitCommit)
+	cmd.SetOut(stdout)
+	if err := cmd.Execute(); err != nil {
+		onError(err)
 	}
 }

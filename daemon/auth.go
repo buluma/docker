@@ -1,10 +1,10 @@
-package daemon
+package daemon // import "github.com/docker/docker/daemon"
 
 import (
-	"golang.org/x/net/context"
+	"context"
 
+	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/dockerversion"
-	"github.com/docker/engine-api/types"
 )
 
 // AuthenticateToRegistry checks the validity of credentials in authConfig
